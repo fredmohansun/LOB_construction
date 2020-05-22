@@ -1,24 +1,14 @@
 import pandas as pd
-import pickle
 import os
-import argparse
 from itertools import compress
 from copy import deepcopy
 from class_definition import order_class, LOB_class
 
-# Debug Parameter
-parser = argparse.ArgumentParser()
-parser.add_argument('-a', '--allowable', type=int, help='Batch size')
-args = parser.parse_args()
-
-allowable = 20 if args.allowable is None else args.allowable
-
 # read data and program initialization
 dir_connector = '\\' if 'nt' in os.name else '/'
 
-for folder in ['Input', 'Output', 'Debug']:
-    if not os.path.isdir(folder):
-        os.mkdir(folder)
+if not os.path.isdir('Output'):
+    os.mkdir('Output')
 
 lsdir = os.listdir('Input')
 csv_file = list(compress(lsdir, ['csv' in files for files in lsdir]))
@@ -76,16 +66,39 @@ for csv in csv_file:
         holder = []
         mktable = None
 
-        # Locate the error record:
-        try:
-            for line, row in sample.iterrows():
+        for _, row in sample.iterrows():
+            ######################################################
+            # The Logic of this for loop:
+            # 1. Special process rule for change reason 8 marketable adjust
+            # 2. Check if there are remained marketable limit yet to be recorded.
+            #    this is due to the fact marketable come in first before trade
+            #    is triggerred
+            # 3. Record midpoints and BBO, depth first
+            # 4. Test if the current order is a marketable limit
+            # 5. (if yes) hold the record until all trade is complete
+            # 5. (if no) update the LOB
+            ######################################################
 
-                mktable_adj_remove = (row.change_reason == 8 and
-                                      row.ob_command == 1 and
-                                      False if mktable is None else
-                                      row.order_number == mktable[1].oid)
+            # Special processing rule for change reason 8 marketable adjust
+            mktable_adj_remove = (row.change_reason == 8 and
+                                  row.ob_command == 1 and
+                                  False if mktable is None else
+                                  row.order_number == mktable[1].oid)
 
-                if mktable_adj_remove:
+            if mktable_adj_remove:
+                if mktable[3] == 0:
+                    LOB.add_order(mktable[1], mktable[2])
+                elif mktable[3] == 2:
+                    LOB.change_order(mktable[1], mktable[2])
+
+                if len(holder):
+                    mktable = holder.pop(0)
+                else:
+                    mktable = None
+
+            # Added other marketable order (change) into LOB
+            if mktable is not None and row.timestamp != mktable[0]:
+                while mktable is not None:
                     if mktable[3] == 0:
                         LOB.add_order(mktable[1], mktable[2])
                     elif mktable[3] == 2:
@@ -96,227 +109,95 @@ for csv in csv_file:
                     else:
                         mktable = None
 
-                if mktable is not None and row.timestamp != mktable[0]:
-                    while mktable is not None:
-                        if mktable[3] == 0:
-                            LOB.add_order(mktable[1], mktable[2])
-                        elif mktable[3] == 2:
-                            LOB.change_order(mktable[1], mktable[2])
+            ######################################################
+            # Record information
+            ######################################################
+            # Calculate pre_trade midpoint
+            # NB: change reason 3 combine with ob command 0 is the remaining of
+            # a large marketable limit order, it is not a trade itself
+            if row.change_reason == 3 and row.ob_command != 0:
+                BBO = LOB.bbo()
+                post_trade_time_list.append([row.timestamp + pd.Timedelta(minutes=5),
+                                             row.sequence_number])
+                if post_trade_time is None:
+                    post_trade_time = post_trade_time_list.pop(0)
+                ind = len(midpoint) + 1
+                midpoint.loc[ind] = date_n_contract + [row.sequence_number,
+                                                       row.timestamp,
+                                                       row.price,
+                                                       sum(BBO) / 2.,
+                                                       0.,
+                                                       2. * row.bid_or_ask - 3.]
+                # Q_jt = 2 * bidask_jt - 3:
+                # Q_jt from HJM 2011 takes 1 for buyer initiated
+                # trades, where offer (2) is taken, and takes -1 for
+                # seller initiated trades, where bid (1) is taken.
 
-                        if len(holder):
-                            mktable = holder.pop(0)
-                        else:
-                            mktable = None
-
-                if row.change_reason == 3 and row.ob_command != 0:
-                    BBO = LOB.bbo()
-                    post_trade_time_list.append([row.timestamp + pd.Timedelta(minutes=5),
-                                                 row.sequence_number])
-                    if post_trade_time is None:
-                        post_trade_time = post_trade_time_list.pop(0)
-                    ind = len(midpoint) + 1
-                    midpoint.loc[ind] = date_n_contract + [row.sequence_number,
-                                                           row.timestamp,
-                                                           row.price,
-                                                           sum(BBO) / 2.,
-                                                           0.,
-                                                           2. * row.bid_or_ask - 3.]
-
-                while five_min is not None and row.timestamp > five_min:
-                    BBO = LOB.bbo()
-                    best_five = LOB.best_five()
-                    ind = len(five_min_depth.index) + 1
-                    five_min_depth.loc[ind] = date_n_contract + [five_min] + BBO + best_five
-                    if len(this_list):
-                        five_min = this_list.pop(0)
-                    else:
-                        five_min = None
-
-                while post_trade_time is not None and row.timestamp > post_trade_time[0]:
-                    BBO = LOB.bbo()
-                    midpoint.post_mid[midpoint.seq_no == post_trade_time[1]] = sum(BBO) / 2.
-                    if len(post_trade_time_list):
-                        post_trade_time = post_trade_time_list.pop(0)
-                    else:
-                        post_trade_time = None
-
-                marketable = (row.ob_command == 0 or row.ob_command == 2) and \
-                        ((LOB.bbo()[1] > 0 and row.price >= LOB.bbo()[1] and
-                          row.bid_or_ask == 1) or
-                         (row.price <= LOB.bbo()[0] and row.bid_or_ask == 2))
-
-                if marketable:
-                    holder.append([row.timestamp,
-                                   order_class(row.order_number,
-                                               row.price,
-                                               row.mp_quantity),
-                                   row.bid_or_ask,
-                                   row.ob_command])
-                    if mktable is None:
-                        mktable = holder.pop(0)
-
+            # Calculate trade midpoint
+            while five_min is not None and row.timestamp > five_min:
+                BBO = LOB.bbo()
+                best_five = LOB.best_five()
+                ind = len(five_min_depth.index) + 1
+                five_min_depth.loc[ind] = date_n_contract + [five_min] + BBO + best_five
+                if len(this_list):
+                    five_min = this_list.pop(0)
                 else:
-                    if row.ob_command == 0:
-                        LOB.add_order(order_class(row.order_number,
-                                                  row.price,
-                                                  row.mp_quantity),
-                                      row.bid_or_ask)
+                    five_min = None
 
-                    elif row.ob_command == 1:
-                        LOB.delete_order(row.order_number, row.bid_or_ask)
-
-                    elif row.ob_command == 2:  # Change an existing order
-                        if row.change_reason == 3:  # execute mktable limit remaining
-                            LOB.traded_order(row.order_number,
-                                             row.bid_or_ask,
-                                             row.quantity_difference)
-                        else:
-                            LOB.change_order(order_class(row.order_number,
-                                                         row.price,
-                                                         row.mp_quantity),
-                                             row.bid_or_ask)
-
-                with open('Debug/%s_%s.pkl' % (contract, row.sequence_number), 'wb') as output:
-                    pickle.dump(LOB, output, pickle.HIGHEST_PROTOCOL)
-                    pickle.dump(this_list, output, pickle.HIGHEST_PROTOCOL)
-                    pickle.dump(five_min, output, pickle.HIGHEST_PROTOCOL)
-                    pickle.dump(post_trade_time_list, output, pickle.HIGHEST_PROTOCOL)
-                    pickle.dump(post_trade_time, output, pickle.HIGHEST_PROTOCOL)
-                    pickle.dump(holder, output, pickle.HIGHEST_PROTOCOL)
-                    pickle.dump(mktable, output, pickle.HIGHEST_PROTOCOL)
-
-                if row.sequence_number > allowable:
-                    os.remove('Debug/%s_%s.pkl' % (contract, row.sequence_number - allowable))
-
-        except ValueError:
-            error_no = row.sequence_number
-            upb = max((error_no - allowable), 0)
-            print('Error found at seq_no: %d at file line %d' % (error_no, line))
-            print('Now going back to file line %d' % (upb))
-
-            with open('Debug/%s_%s.pkl' % (contract, upb), 'rb') as myinput:
-                LOB = pickle.load(myinput)
-                this_list = pickle.load(myinput)
-                five_min = pickle.load(myinput)
-                post_trade_time_list = pickle.load(myinput)
-                post_trade_time = pickle.load(myinput)
-                holder = pickle.load(myinput)
-                mktable = pickle.load(myinput)
-
-            print(LOB)
-
-            row_iter = sample.iterrows()
-            row_ind = 0
-            while row_ind < upb:
-                _, row = next(row_iter)
-                row_ind = row.sequence_number
-
-            print('Jumped to error location: %d' % row.sequence_number)
-
-            while input('process next row? ') == 'y':
-                _, row = next(row_iter)
-                print(row.sequence_number)
-
-                mktable_adj_remove = (row.change_reason == 8 and
-                                      row.ob_command == 1 and
-                                      False if mktable is None else
-                                      row.order_number == mktable[1].oid)
-
-                if mktable_adj_remove:
-                    if mktable[3] == 0:
-                        LOB.add_order(mktable[1], mktable[2])
-                    elif mktable[3] == 2:
-                        LOB.change_order(mktable[1], mktable[2])
-
-                    if len(holder):
-                        mktable = holder.pop(0)
-                    else:
-                        mktable = None
-
-                if mktable is not None and row.timestamp != mktable[0]:
-                    while mktable is not None:
-                        if mktable[3] == 0:
-                            LOB.add_order(mktable[1], mktable[2])
-                        elif mktable[3] == 2:
-                            LOB.change_order(mktable[1], mktable[2])
-
-                        if len(holder):
-                            mktable = holder.pop(0)
-                        else:
-                            mktable = None
-
-                if row.change_reason == 3 and row.ob_command != 0:
-                    BBO = LOB.bbo()
-                    post_trade_time_list.append([row.timestamp + pd.Timedelta(minutes=5),
-                                                 row.sequence_number])
-                    if post_trade_time is None:
-                        post_trade_time = post_trade_time_list.pop(0)
-                    ind = len(midpoint) + 1
-                    midpoint.loc[ind] = date_n_contract + [row.sequence_number,
-                                                           row.timestamp,
-                                                           row.price,
-                                                           sum(BBO) / 2.,
-                                                           0.,
-                                                           2. * row.bid_or_ask - 3.]
-
-                while five_min is not None and row.timestamp > five_min:
-                    BBO = LOB.bbo()
-                    best_five = LOB.best_five()
-                    ind = len(five_min_depth.index) + 1
-                    five_min_depth.loc[ind] = date_n_contract + [five_min] + BBO + best_five
-                    if len(this_list):
-                        five_min = this_list.pop(0)
-                    else:
-                        five_min = None
-
-                while post_trade_time is not None and row.timestamp > post_trade_time[0]:
-                    BBO = LOB.bbo()
-                    midpoint.post_mid[midpoint.seq_no == post_trade_time[1]] = sum(BBO) / 2.
-                    if len(post_trade_time_list):
-                        post_trade_time = post_trade_time_list.pop(0)
-                    else:
-                        post_trade_time = None
-
-                marketable = (row.ob_command == 0 or row.ob_command == 2) and \
-                        ((LOB.bbo()[1] > 0 and row.price >= LOB.bbo()[1] and
-                          row.bid_or_ask == 1) or
-                         (row.price <= LOB.bbo()[0] and row.bid_or_ask == 2))
-
-                if marketable:
-                    holder.append([row.timestamp,
-                                   order_class(row.order_number,
-                                               row.price,
-                                               row.mp_quantity),
-                                   row.bid_or_ask,
-                                   row.ob_command])
-                    if mktable is None:
-                        mktable = holder.pop(0)
-
+            # Calculate post trade midpoint
+            while post_trade_time is not None and row.timestamp > post_trade_time[0]:
+                BBO = LOB.bbo()
+                midpoint.post_mid[midpoint.seq_no == post_trade_time[1]] = sum(BBO) / 2.
+                if len(post_trade_time_list):
+                    post_trade_time = post_trade_time_list.pop(0)
                 else:
-                    if row.ob_command == 0:
-                        LOB.add_order(order_class(row.order_number,
-                                                  row.price,
-                                                  row.mp_quantity),
-                                      row.bid_or_ask)
+                    post_trade_time = None
 
-                    elif row.ob_command == 1:
-                        LOB.delete_order(row.order_number, row.bid_or_ask)
+            ######################################################
+            # Update LOB
+            ######################################################
+            # SGX marketable order appear before the counter-party order
+            # We will put order (change) into LOB after execution of
+            # counter-party order
+            marketable = (row.ob_command == 0 or row.ob_command == 2) and \
+                    ((LOB.bbo()[1] > 0 and row.price >= LOB.bbo()[1] and
+                      row.bid_or_ask == 1) or
+                     (row.price <= LOB.bbo()[0] and row.bid_or_ask == 2))
 
-                    elif row.ob_command == 2:  # Change an existing order
-                        if row.change_reason == 3:  # execute mktable limit remaining
-                            LOB.traded_order(row.order_number,
-                                             row.bid_or_ask,
-                                             row.quantity_difference)
-                        else:
-                            LOB.change_order(order_class(row.order_number,
-                                                         row.price,
-                                                         row.mp_quantity),
-                                             row.bid_or_ask)
+            if marketable:
+                holder.append([row.timestamp,
+                               order_class(row.order_number,
+                                           row.price,
+                                           row.mp_quantity),
+                               row.bid_or_ask,
+                               row.ob_command])
+                if mktable is None:
+                    mktable = holder.pop(0)
 
-                print(LOB)
-                # print(five_min_list)
-                # print(post_trade_time)
-                # print(post_trade_time_list)
+            # Normal update process
+            else:
+                # Add a new order or remain of marketable order
+                if row.ob_command == 0:
+                    LOB.add_order(order_class(row.order_number,
+                                              row.price,
+                                              row.mp_quantity),
+                                  row.bid_or_ask)
+
+                # Delete order
+                elif row.ob_command == 1:
+                    LOB.delete_order(row.order_number, row.bid_or_ask)
+
+                # Change existing order
+                elif row.ob_command == 2:  # Change an existing order
+                    if row.change_reason == 3:  # execute mktable limit remaining
+                        LOB.traded_order(row.order_number,
+                                         row.bid_or_ask,
+                                         row.quantity_difference)
+                    else:
+                        LOB.change_order(order_class(row.order_number,
+                                                     row.price,
+                                                     row.mp_quantity),
+                                         row.bid_or_ask)
 
         # Calculate trade midpoint after the last record
         while five_min is not None:
