@@ -16,7 +16,7 @@ allowable = 20 if args.allowable is None else args.allowable
 # read data and program initialization
 dir_connector = '\\' if 'nt' in os.name else '/'
 
-for folder in ['Input','Output','Debug']:
+for folder in ['Input', 'Output', 'Debug']:
     if not os.path.isdir(folder):
         os.mkdir(folder)
 
@@ -79,6 +79,23 @@ for csv in csv_file:
         # Locate the error record:
         try:
             for line, row in sample.iterrows():
+
+                mktable_adj_remove = (row.change_reason == 8 and
+                                      row.ob_command == 1 and
+                                      False if mktable is None else
+                                      row.order_number == mktable[1].oid)
+
+                if mktable_adj_remove:
+                    if mktable[3] == 0:
+                        LOB.add_order(mktable[1], mktable[2])
+                    elif mktable[3] == 2:
+                        LOB.change_order(mktable[1], mktable[2])
+
+                    if len(holder):
+                        mktable = holder.pop(0)
+                    else:
+                        mktable = None
+
                 if mktable is not None and row.timestamp != mktable[0]:
                     while mktable is not None:
                         if mktable[3] == 0:
@@ -190,15 +207,32 @@ for csv in csv_file:
 
             row_iter = sample.iterrows()
             row_ind = 0
-            while row_ind < upb - 1:
-                row_ind, row = next(row_iter)
+            while row_ind < upb:
+                _, row = next(row_iter)
+                row_ind = row.sequence_number
 
             print('Jumped to error location: %d' % row.sequence_number)
 
             while input('process next row? ') == 'y':
                 _, row = next(row_iter)
                 print(row.sequence_number)
-                print(row.timestamp, mktable[0] if mktable is not None else 0)
+
+                mktable_adj_remove = (row.change_reason == 8 and
+                                      row.ob_command == 1 and
+                                      False if mktable is None else
+                                      row.order_number == mktable[1].oid)
+
+                if mktable_adj_remove:
+                    if mktable[3] == 0:
+                        LOB.add_order(mktable[1], mktable[2])
+                    elif mktable[3] == 2:
+                        LOB.change_order(mktable[1], mktable[2])
+
+                    if len(holder):
+                        mktable = holder.pop(0)
+                    else:
+                        mktable = None
+
                 if mktable is not None and row.timestamp != mktable[0]:
                     while mktable is not None:
                         if mktable[3] == 0:
@@ -249,17 +283,13 @@ for csv in csv_file:
                          (row.price <= LOB.bbo()[0] and row.bid_or_ask == 2))
 
                 if marketable:
-                    print('hi')
                     holder.append([row.timestamp,
                                    order_class(row.order_number,
                                                row.price,
                                                row.mp_quantity),
                                    row.bid_or_ask,
                                    row.ob_command])
-                    print('yo')
-                    print(mktable)
                     if mktable is None:
-                        print('hello')
                         mktable = holder.pop(0)
 
                 else:
@@ -284,8 +314,6 @@ for csv in csv_file:
                                              row.bid_or_ask)
 
                 print(LOB)
-                print(holder)
-                print(mktable)
                 # print(five_min_list)
                 # print(post_trade_time)
                 # print(post_trade_time_list)
